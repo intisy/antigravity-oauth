@@ -1,0 +1,235 @@
+import { accessTokenExpired } from "./auth";
+import type { OAuthAuthDetails } from "./types";
+import { createHash } from "node:crypto";
+
+const authCache = new Map<string, OAuthAuthDetails>();
+
+/**
+ * Produces a stable cache key from a refresh token string.
+ */
+function normalizeRefreshKey(refresh?: string): string | undefined {
+  const key = refresh?.trim();
+  return key ? key : undefined;
+}
+
+/**
+ * Returns a cached auth snapshot when available, favoring unexpired tokens.
+ */
+export function resolveCachedAuth(auth: OAuthAuthDetails): OAuthAuthDetails {
+  const key = normalizeRefreshKey(auth.refresh);
+  if (!key) {
+    return auth;
+  }
+
+  const cached = authCache.get(key);
+  if (!cached) {
+    authCache.set(key, auth);
+    return auth;
+  }
+
+  if (!accessTokenExpired(auth)) {
+    authCache.set(key, auth);
+    return auth;
+  }
+
+  if (!accessTokenExpired(cached)) {
+    return cached;
+  }
+
+  authCache.set(key, auth);
+  return auth;
+}
+
+/**
+ * Stores the latest auth snapshot keyed by refresh token.
+ */
+export function storeCachedAuth(auth: OAuthAuthDetails): void {
+  const key = normalizeRefreshKey(auth.refresh);
+  if (!key) {
+    return;
+  }
+  authCache.set(key, auth);
+}
+
+/**
+ * Clears cached auth globally or for a specific refresh token.
+ */
+export function clearCachedAuth(refresh?: string): void {
+  if (!refresh) {
+    authCache.clear();
+    return;
+  }
+  const key = normalizeRefreshKey(refresh);
+  if (key) {
+    authCache.delete(key);
+  }
+}
+
+// ============================================================================
+
+// ============================================================================
+
+import { SignatureCache, createSignatureCache } from "./cache/signature-cache";
+import type { SignatureCacheConfig } from "./config";
+
+interface SignatureEntry {
+  signature: string;
+  timestamp: number;
+}
+
+
+const signatureCache = new Map<string, Map<string, SignatureEntry>>();
+
+
+const SIGNATURE_CACHE_TTL_MS = 60 * 60 * 1000;
+
+
+const MAX_ENTRIES_PER_SESSION = 100;
+
+// 16 hex chars = 64-bit key space; keeps memory bounded while making collisions extremely unlikely.
+const SIGNATURE_TEXT_HASH_HEX_LEN = 16;
+
+
+let diskCache: SignatureCache | null = null;
+
+/**
+ * Initialize the disk-based signature cache.
+ * Call this from plugin initialization when keep_thinking is enabled.
+ */
+export function initDiskSignatureCache(config: SignatureCacheConfig | undefined): SignatureCache | null {
+  diskCache = createSignatureCache(config);
+  return diskCache;
+}
+
+/**
+ * Get the disk cache instance (for testing/debugging).
+ */
+export function getDiskSignatureCache(): SignatureCache | null {
+  return diskCache;
+}
+
+/**
+ * Hashes text content into a stable, Unicode-safe key.
+ *
+ * Uses SHA-256 over UTF-8 bytes and truncates to keep memory usage bounded.
+ */
+function hashText(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, SIGNATURE_TEXT_HASH_HEX_LEN);
+}
+
+/**
+ * Create a disk cache key from sessionId and textHash.
+ */
+function makeDiskKey(sessionId: string, textHash: string): string {
+  return `${sessionId}:${textHash}`;
+}
+
+/**
+ * Caches a thinking signature for a given session and text.
+ * Used for Claude models that require signed thinking blocks in multi-turn conversations.
+ * Also writes to disk cache if enabled.
+ */
+export function cacheSignature(sessionId: string, text: string, signature: string): void {
+  if (!sessionId || !text || !signature) return;
+
+  const textHash = hashText(text);
+
+
+  let sessionMemCache = signatureCache.get(sessionId);
+  if (!sessionMemCache) {
+    sessionMemCache = new Map();
+    signatureCache.set(sessionId, sessionMemCache);
+  }
+
+
+  if (sessionMemCache.size >= MAX_ENTRIES_PER_SESSION) {
+    const now = Date.now();
+    for (const [key, entry] of sessionMemCache.entries()) {
+      if (now - entry.timestamp > SIGNATURE_CACHE_TTL_MS) {
+        sessionMemCache.delete(key);
+      }
+    }
+
+    if (sessionMemCache.size >= MAX_ENTRIES_PER_SESSION) {
+      const entries = Array.from(sessionMemCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toRemove = entries.slice(0, Math.floor(MAX_ENTRIES_PER_SESSION / 4));
+      for (const [key] of toRemove) {
+        sessionMemCache.delete(key);
+      }
+    }
+  }
+
+  sessionMemCache.set(textHash, { signature, timestamp: Date.now() });
+
+
+  if (diskCache) {
+    const diskKey = makeDiskKey(sessionId, textHash);
+    diskCache.store(diskKey, signature);
+  }
+}
+
+/**
+ * Retrieves a cached signature for a given session and text.
+ * Checks memory first, then falls back to disk cache.
+ * Returns undefined if not found or expired.
+ */
+export function getCachedSignature(sessionId: string, text: string): string | undefined {
+  if (!sessionId || !text) return undefined;
+
+  const textHash = hashText(text);
+
+
+  const sessionMemCache = signatureCache.get(sessionId);
+  if (sessionMemCache) {
+    const entry = sessionMemCache.get(textHash);
+    if (entry) {
+
+      if (Date.now() - entry.timestamp > SIGNATURE_CACHE_TTL_MS) {
+        sessionMemCache.delete(textHash);
+      } else {
+        return entry.signature;
+      }
+    }
+  }
+
+
+  if (diskCache) {
+    const diskKey = makeDiskKey(sessionId, textHash);
+    const diskValue = diskCache.retrieve(diskKey);
+    if (diskValue) {
+
+      let memCache = signatureCache.get(sessionId);
+      if (!memCache) {
+        memCache = new Map();
+        signatureCache.set(sessionId, memCache);
+      }
+      memCache.set(textHash, { signature: diskValue, timestamp: Date.now() });
+      return diskValue;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Clears signature cache for a specific session or all sessions.
+ * Also clears from disk cache if enabled.
+ */
+export function clearSignatureCache(sessionId?: string): void {
+  if (sessionId) {
+    signatureCache.delete(sessionId);
+
+  } else {
+    signatureCache.clear();
+
+  }
+}
+
+// ============================================================================
+
+// ============================================================================
+
+
+export { SignatureCache, createSignatureCache } from "./cache/signature-cache";
+export type { SignatureCacheConfig } from "./config";
